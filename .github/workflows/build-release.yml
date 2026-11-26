@@ -1,0 +1,119 @@
+name: Build & Release cloudflared (PR #1020 ALL_PROXY)
+
+on:
+  schedule:
+    # Daily at 20:15 UTC (04:15 Asia/Shanghai)
+    - cron: "15 20 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag (leave empty for latest)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if release already exists"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork control files
+        uses: actions/checkout@v4
+        with:
+          path: self
+          fetch-depth: 1
+
+      - name: Resolve target upstream release tag
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG=$(gh api repos/cloudflare/cloudflared/releases/latest --jq '.tag_name')
+          fi
+          echo "Target upstream tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "${{ inputs.force }}" != "true" ]; then
+              echo "Release $TAG already exists; skipping."
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+
+      - name: Clone upstream tag & apply PR #1020 patch
+        if: steps.target.outputs.exists != 'true'
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+          git clone --depth=1 --branch "$TAG" https://github.com/cloudflare/cloudflared.git upstream
+          cd upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git apply --check ../self/patches/pr-1020.patch
+          git apply ../self/patches/pr-1020.patch
+          git commit -am "feat: apply cloudflare/cloudflared#1020 ALL_PROXY support"
+          git tag -f "$TAG" HEAD
+
+      - name: Setup Go from upstream go.mod
+        if: steps.target.outputs.exists != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+          cache: true
+          cache-dependency-path: upstream/go.sum
+
+      - name: Test patched package & cross-compile (amd64 + arm64)
+        if: steps.target.outputs.exists != 'true'
+        run: |
+          mkdir -p dist
+          cd upstream
+          go test -v ./edgediscovery/...
+          CGO_ENABLED=0 TARGET_OS=linux TARGET_ARCH=amd64 make cloudflared
+          mv cloudflared ../dist/cloudflared-linux-amd64
+          CGO_ENABLED=0 TARGET_OS=linux TARGET_ARCH=arm64 make cloudflared
+          mv cloudflared ../dist/cloudflared-linux-arm64
+          cd ../dist
+          file cloudflared-linux-amd64 cloudflared-linux-arm64
+          ./cloudflared-linux-amd64 --version
+          sha256sum cloudflared-linux-amd64 cloudflared-linux-arm64 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Push tag & publish GitHub Release
+        if: steps.target.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.target.outputs.tag }}"
+          cd upstream
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --force fork "refs/tags/$TAG"
+          cd ..
+
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* -R "${{ github.repository }}" --clobber
+          else
+            printf '%s\n' \
+              "Upstream [cloudflare/cloudflared ${TAG}](https://github.com/cloudflare/cloudflared/releases/tag/${TAG}) built with [PR #1020](https://github.com/cloudflare/cloudflared/pull/1020) (\`ALL_PROXY\` SOCKS5 support over HTTP/2)." \
+              "" \
+              "Usage:" \
+              "\`\`\`bash" \
+              "ALL_PROXY=socks5://127.0.0.1:8181 \\" \
+              "TUNNEL_TRANSPORT_PROTOCOL=http2 \\" \
+              "GODEBUG=tlsmlkem=0 \\" \
+              "./cloudflared-linux-arm64 tunnel run" \
+              "\`\`\`" > release_notes.md
+            gh release create "$TAG" dist/* \
+              -R "${{ github.repository }}" \
+              --title "$TAG (ALL_PROXY)" \
+              --notes-file release_notes.md
+          fi
